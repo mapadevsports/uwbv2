@@ -6,7 +6,6 @@ from sqlalchemy import text
 from db import Base, engine
 import models  # garante que as classes sejam registradas no Base antes do create_all
 from dados_crus import router as dados_crus_router
-app.include_router(dados_crus_router)
 
 
 app = FastAPI(
@@ -23,6 +22,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+app.include_router(dados_crus_router)
+
 
 # 🔌 Testa conexão e cria tabelas no startup (enquanto não usa Alembic)
 @app.on_event("startup")
