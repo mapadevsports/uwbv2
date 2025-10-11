@@ -13,6 +13,9 @@ router = APIRouter(prefix="/dados-crus", tags=["Dados crus"])
 # URL da nova rota de processamento
 PROCESS_URL = "https://uwb-api.onrender.com/processamento-crus/ingest"
 
+# TAGs reservadas para calibração: devem ser ignoradas
+CALIBRATION_TAGS = {"62", "63"}
+
 # Regex que captura tid, range(...), kx e ky
 RE_LINE = re.compile(
     r"tid\s*:\s*(?P<tid>\d+).*?"
@@ -32,7 +35,7 @@ def _to_float_or_none(x: str):
         return None
 
 def parse_line(line: str):
-    """Extrai tid, range[], kx e ky de uma linha AT+RANGE."""
+    """Extrai tid, range[8], kx e ky de uma linha AT+RANGE."""
     m = RE_LINE.search(line)
     if not m:
         return None
@@ -56,8 +59,11 @@ def ingest_dados_crus(
     )
 ):
     """
-    Recebe string ou lista de strings (linhas AT+RANGE) e grava em `distancias_uwb`.
-    Após salvar, envia os mesmos dados à rota /processamento-crus/ingest.
+    Recebe string ou lista de strings (linhas AT+RANGE),
+    grava em `distancias_uwb` e, depois, chama /processamento-crus/ingest.
+
+    Observação: leituras das TAGs 62 e 63 (calibração) são ignoradas:
+    não são persistidas e não são encaminhadas.
     """
     # Normaliza payload → lista de linhas válidas
     if isinstance(payload, str):
@@ -72,12 +78,22 @@ def ingest_dados_crus(
     try:
         rows = []
         now = datetime.utcnow()
+        skipped_calibration = 0
+        skipped_invalid = 0
 
         for line in lines:
             parsed = parse_line(line)
             if not parsed:
+                skipped_invalid += 1
                 continue
+
             tag, vals, kx, ky = parsed
+
+            # IGNORA calibração (tags 62 e 63)
+            if tag in CALIBRATION_TAGS:
+                skipped_calibration += 1
+                continue
+
             rows.append(
                 models.DistanciaUWB(
                     tag_number=tag,
@@ -88,12 +104,16 @@ def ingest_dados_crus(
             )
 
         if not rows:
-            raise HTTPException(status_code=422, detail="nenhuma linha válida encontrada")
+            # nada elegível para gravação após filtros
+            raise HTTPException(
+                status_code=422,
+                detail="nenhuma linha elegível (todas inválidas ou de calibração 62/63)",
+            )
 
         db.add_all(rows)
         db.commit()
 
-        # Prepara payload simplificado para o processamento
+        # Prepara payload simplificado para o processamento (apenas o que foi salvo)
         serialized = [
             {
                 "id": r.id,
@@ -107,15 +127,25 @@ def ingest_dados_crus(
         ]
 
         # Envia os dados recém-gravados para a rota de processamento
+        sent_to_processamento = False
         try:
             res = requests.post(PROCESS_URL, json={"dados": serialized}, timeout=3)
-            if res.status_code not in (200, 201):
+            sent_to_processamento = res.status_code in (200, 201)
+            if not sent_to_processamento:
                 print(f"[AVISO] Falha ao acionar processamento_crus: {res.status_code} {res.text}")
         except Exception as e:
             print(f"[ERRO] Não foi possível contatar {PROCESS_URL}: {e}")
 
-        return {"saved": len(rows), "sent_to_processamento": True}
+        return {
+            "saved": len(rows),
+            "skipped_calibration": skipped_calibration,
+            "skipped_invalid": skipped_invalid,
+            "sent_to_processamento": sent_to_processamento,
+        }
 
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erro ao salvar: {e}")
