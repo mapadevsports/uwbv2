@@ -1,27 +1,26 @@
 # dados_crus.py
-from fastapi import APIRouter, Body, HTTPException, Query
-from typing import List, Union, Tuple, Optional, Dict, Any
+from fastapi import APIRouter, Body, HTTPException
+from typing import List, Union
 from datetime import datetime
 import re
+import requests
 
 from db import SessionLocal
 import models
 
 router = APIRouter(prefix="/dados-crus", tags=["Dados crus"])
 
-# tid e o conteúdo de range:(...)
+# URL da nova rota de processamento
+PROCESS_URL = "https://uwb-api.onrender.com/processamento-crus/ingest"
+
+# Regex que captura tid, range(...), kx e ky
 RE_LINE = re.compile(
-    r"tid\s*:\s*(?P<tid>\d+).*?range\s*:\s*\((?P<rng>[^)]*)\)",
+    r"tid\s*:\s*(?P<tid>\d+).*?"
+    r"range\s*:\s*\((?P<rng>[^)]*)\).*?"
+    r"kx\s*:\s*(?P<kx>[-+]?\d*\.?\d+).*?"
+    r"ky\s*:\s*(?P<ky>[-+]?\d*\.?\d+)",
     re.IGNORECASE,
 )
-
-# números: aceita -, +, inteiros, .123, 123., 123.45
-NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
-
-# kx/ky: muito tolerante, aceita "...,kx:0.00,ky:358.95,user:..." etc.
-RE_KX = re.compile(rf"kx\s*:\s*({NUM})(?=,|$|\s)", re.IGNORECASE)
-RE_KY = re.compile(rf"ky\s*:\s*({NUM})(?=,|$|\s)", re.IGNORECASE)
-
 
 def _to_float_or_none(x: str):
     x = x.strip()
@@ -32,73 +31,35 @@ def _to_float_or_none(x: str):
     except ValueError:
         return None
 
-
-def parse_line(line: str) -> Optional[Tuple[str, List[Optional[float]], Optional[float], Optional[float]]]:
-    """
-    Retorna:
-      (tag_number, [da0..da7], kx|None, ky|None)
-    ou None se a linha não casar com o padrão mínimo (tid + range).
-    """
+def parse_line(line: str):
+    """Extrai tid, range[], kx e ky de uma linha AT+RANGE."""
     m = RE_LINE.search(line)
     if not m:
         return None
-
     tid = m.group("tid").strip()
-
-    # range -> da0..da7
     parts = [p.strip() for p in m.group("rng").split(",")]
     vals = (parts + [""] * 8)[:8]
     floats = [_to_float_or_none(v) for v in vals]
-
-    # kx/ky em qualquer lugar da linha
-    kx_m = RE_KX.search(line)
-    ky_m = RE_KY.search(line)
-    kx = float(kx_m.group(1)) if kx_m else None
-    ky = float(ky_m.group(1)) if ky_m else None
-
-    return str(tid), floats, kx, ky
-
-
-@router.get("/debug-parse")
-def debug_parse(line: str = Query(..., description="Linha AT+RANGE crua")) -> Dict[str, Any]:
-    """
-    Só parseia a linha e retorna o que seria gravado.
-    Útil para verificar rapidamente kx/ky e da0..da7.
-    """
-    parsed = parse_line(line)
-    if not parsed:
-        raise HTTPException(status_code=422, detail="Linha não casou com o padrão (precisa de tid e range:(...))")
-
-    tag, vals, kx, ky = parsed
-    return {
-        "tag_number": tag,
-        "da": vals,
-        "kx": kx,
-        "ky": ky,
-    }
+    kx = _to_float_or_none(m.group("kx"))
+    ky = _to_float_or_none(m.group("ky"))
+    return tid, floats, kx, ky
 
 
 @router.post("/ingest")
 def ingest_dados_crus(
-    # aceita {"payload": "..."} ou {"payload": ["...", "..."]}
     payload: Union[str, List[str]] = Body(
         ...,
         embed=True,
         example=[
-            "AT+RANGE=tid:63,range:(366,329,0,0,0,0,0,0),kx:0.00,ky:358.95,user:user1"
+            "AT+RANGE=tid:4,mask:01,seq:218,range:(3,0,0,0,0,0,0,0),kx:100.0,ky:200.0,user:user1"
         ],
     )
 ):
     """
-    Recebe string com 1+ linhas (separadas por \\n) **ou** lista de strings.
-    Cada linha gera 1 insert em `distancias_uwb`.
-
-    Campos:
-      - obrigatórios: tid, range:(da0..da7)
-      - opcionais: kx:<float>, ky:<float> (em qualquer posição)
-    Obs.: `id` é autoincrement e não deve ser informado.
+    Recebe string ou lista de strings (linhas AT+RANGE) e grava em `distancias_uwb`.
+    Após salvar, envia os mesmos dados à rota /processamento-crus/ingest.
     """
-    # Normaliza para lista de linhas
+    # Normaliza payload → lista de linhas válidas
     if isinstance(payload, str):
         lines = [ln for ln in payload.splitlines() if ln.strip()]
     else:
@@ -107,46 +68,56 @@ def ingest_dados_crus(
     if not lines:
         raise HTTPException(status_code=400, detail="payload vazio")
 
-    saved, skipped = 0, 0
-    parsed_preview: List[Dict[str, Any]] = []  # devolvemos uma amostra do parse
-
     db = SessionLocal()
     try:
         rows = []
         now = datetime.utcnow()
+
         for line in lines:
             parsed = parse_line(line)
             if not parsed:
-                skipped += 1
                 continue
-
             tag, vals, kx, ky = parsed
-            parsed_preview.append({"tag": tag, "da": vals, "kx": kx, "ky": ky})
-
             rows.append(
                 models.DistanciaUWB(
                     tag_number=tag,
                     da0=vals[0], da1=vals[1], da2=vals[2], da3=vals[3],
                     da4=vals[4], da5=vals[5], da6=vals[6], da7=vals[7],
-                    kx=kx, ky=ky,
-                    criado_em=now,
+                    kx=kx, ky=ky, criado_em=now,
                 )
             )
 
-        if rows:
-            db.add_all(rows)
-            db.commit()
-            saved = len(rows)
+        if not rows:
+            raise HTTPException(status_code=422, detail="nenhuma linha válida encontrada")
 
-        # devolvemos só uma amostra das primeiras 5 linhas parseadas
-        return {
-            "saved": saved,
-            "skipped": skipped,
-            "received_lines": len(lines),
-            "preview": parsed_preview[:5],
-        }
-    except Exception:
+        db.add_all(rows)
+        db.commit()
+
+        # Prepara payload simplificado para o processamento
+        serialized = [
+            {
+                "id": r.id,
+                "tag_number": r.tag_number,
+                "da": [r.da0, r.da1, r.da2, r.da3, r.da4, r.da5, r.da6, r.da7],
+                "kx": r.kx,
+                "ky": r.ky,
+                "criado_em": r.criado_em.isoformat() if r.criado_em else None,
+            }
+            for r in rows
+        ]
+
+        # Envia os dados recém-gravados para a rota de processamento
+        try:
+            res = requests.post(PROCESS_URL, json={"dados": serialized}, timeout=3)
+            if res.status_code not in (200, 201):
+                print(f"[AVISO] Falha ao acionar processamento_crus: {res.status_code} {res.text}")
+        except Exception as e:
+            print(f"[ERRO] Não foi possível contatar {PROCESS_URL}: {e}")
+
+        return {"saved": len(rows), "sent_to_processamento": True}
+
+    except Exception as e:
         db.rollback()
-        raise
+        raise HTTPException(status_code=500, detail=f"Erro ao salvar: {e}")
     finally:
         db.close()
