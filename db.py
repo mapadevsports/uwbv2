@@ -2,28 +2,25 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
-# Lê a URL do Render (Settings → Environment → DATABASE_URL)
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL não definida. Configure no Render (ou no .env local)."
-    )
+raw_url = os.getenv("DATABASE_URL")
+if not raw_url:
+    raise RuntimeError("DATABASE_URL não definida.")
 
-# Dica: se o Render exigir TLS/SSL e der erro de SSL, adicione '?sslmode=require' na URL.
-# Ex.: postgresql://...render.com/uwb1?sslmode=require
+# Força o driver psycopg3
+if raw_url.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + raw_url[len("postgresql://"):]
+else:
+    DATABASE_URL = raw_url
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,   # evita conexões zumbis
-    pool_size=5,          # bons defaults; ajuste se necessário
-    max_overflow=10,
-)
+# Se precisar TLS no Render:
+# if "sslmode=" not in DATABASE_URL:
+#     sep = "&" if "?" in DATABASE_URL else "?"
+#     DATABASE_URL = f"{DATABASE_URL}{sep}sslmode=require"
 
-class Base(DeclarativeBase):
-    pass
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
 
+class Base(DeclarativeBase): pass
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-
 def get_db():
     db = SessionLocal()
     try:
