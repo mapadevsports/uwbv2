@@ -5,6 +5,9 @@ from sqlalchemy import text
 # 👇 importa direto da raiz
 from db import Base, engine
 import models  # garante que as classes sejam registradas no Base antes do create_all
+from dados_crus import router as dados_crus_router
+app.include_router(dados_crus_router)
+
 
 app = FastAPI(
     title="UWB API v2",
