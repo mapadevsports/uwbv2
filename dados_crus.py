@@ -1,6 +1,6 @@
 # dados_crus.py
-from fastapi import APIRouter, Body, HTTPException
-from typing import List, Union, Tuple, Optional
+from fastapi import APIRouter, Body, HTTPException, Query
+from typing import List, Union, Tuple, Optional, Dict, Any
 from datetime import datetime
 import re
 
@@ -15,9 +15,12 @@ RE_LINE = re.compile(
     re.IGNORECASE,
 )
 
-# kx/ky numéricos (robusto: +/-, .123, 123., 123.45, 0.00 etc.)
+# números: aceita -, +, inteiros, .123, 123., 123.45
 NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
-RE_K_BOTH = re.compile(rf"\b(k[xy])\s*:\s*({NUM})", re.IGNORECASE)
+
+# kx/ky: muito tolerante, aceita "...,kx:0.00,ky:358.95,user:..." etc.
+RE_KX = re.compile(rf"kx\s*:\s*({NUM})(?=,|$|\s)", re.IGNORECASE)
+RE_KY = re.compile(rf"ky\s*:\s*({NUM})(?=,|$|\s)", re.IGNORECASE)
 
 
 def _to_float_or_none(x: str):
@@ -30,7 +33,7 @@ def _to_float_or_none(x: str):
         return None
 
 
-def parse_line(line: str) -> Optional[Tuple[str, list, Optional[float], Optional[float]]]:
+def parse_line(line: str) -> Optional[Tuple[str, List[Optional[float]], Optional[float], Optional[float]]]:
     """
     Retorna:
       (tag_number, [da0..da7], kx|None, ky|None)
@@ -40,7 +43,6 @@ def parse_line(line: str) -> Optional[Tuple[str, list, Optional[float], Optional
     if not m:
         return None
 
-    # tid
     tid = m.group("tid").strip()
 
     # range -> da0..da7
@@ -48,18 +50,32 @@ def parse_line(line: str) -> Optional[Tuple[str, list, Optional[float], Optional
     vals = (parts + [""] * 8)[:8]
     floats = [_to_float_or_none(v) for v in vals]
 
-    # kx/ky em qualquer lugar da linha (ordem livre)
-    kx: Optional[float] = None
-    ky: Optional[float] = None
-    for mm in RE_K_BOTH.finditer(line):
-        label = mm.group(1).lower()  # 'kx' ou 'ky'
-        value = float(mm.group(2))
-        if label == "kx":
-            kx = value
-        elif label == "ky":
-            ky = value
+    # kx/ky em qualquer lugar da linha
+    kx_m = RE_KX.search(line)
+    ky_m = RE_KY.search(line)
+    kx = float(kx_m.group(1)) if kx_m else None
+    ky = float(ky_m.group(1)) if ky_m else None
 
     return str(tid), floats, kx, ky
+
+
+@router.get("/debug-parse")
+def debug_parse(line: str = Query(..., description="Linha AT+RANGE crua")) -> Dict[str, Any]:
+    """
+    Só parseia a linha e retorna o que seria gravado.
+    Útil para verificar rapidamente kx/ky e da0..da7.
+    """
+    parsed = parse_line(line)
+    if not parsed:
+        raise HTTPException(status_code=422, detail="Linha não casou com o padrão (precisa de tid e range:(...))")
+
+    tag, vals, kx, ky = parsed
+    return {
+        "tag_number": tag,
+        "da": vals,
+        "kx": kx,
+        "ky": ky,
+    }
 
 
 @router.post("/ingest")
@@ -92,6 +108,8 @@ def ingest_dados_crus(
         raise HTTPException(status_code=400, detail="payload vazio")
 
     saved, skipped = 0, 0
+    parsed_preview: List[Dict[str, Any]] = []  # devolvemos uma amostra do parse
+
     db = SessionLocal()
     try:
         rows = []
@@ -103,6 +121,8 @@ def ingest_dados_crus(
                 continue
 
             tag, vals, kx, ky = parsed
+            parsed_preview.append({"tag": tag, "da": vals, "kx": kx, "ky": ky})
+
             rows.append(
                 models.DistanciaUWB(
                     tag_number=tag,
@@ -118,7 +138,13 @@ def ingest_dados_crus(
             db.commit()
             saved = len(rows)
 
-        return {"saved": saved, "skipped": skipped, "received_lines": len(lines)}
+        # devolvemos só uma amostra das primeiras 5 linhas parseadas
+        return {
+            "saved": saved,
+            "skipped": skipped,
+            "received_lines": len(lines),
+            "preview": parsed_preview[:5],
+        }
     except Exception:
         db.rollback()
         raise
