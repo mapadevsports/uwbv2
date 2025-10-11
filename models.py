@@ -16,6 +16,8 @@ class DistanciaUWB(Base):
     da5: Mapped[float | None] = mapped_column(Float)
     da6: Mapped[float | None] = mapped_column(Float)
     da7: Mapped[float | None] = mapped_column(Float)
+    kx: Mapped[float | None] = mapped_column(Float)
+    ky: Mapped[float | None] = mapped_column(Float) 
 
     criado_em: Mapped[DateTime] = mapped_column(
         DateTime(timezone=True),
