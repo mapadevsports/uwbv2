@@ -1,153 +1,45 @@
-# dados_crus.py
-from fastapi import APIRouter, Body, HTTPException
-from typing import List, Union
-from datetime import datetime
-import re
-import requests
+# main.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
-from db import SessionLocal
-import models
+from db import Base, engine
+import models  # registra os models antes do create_all
 
-router = APIRouter(prefix="/dados-crus", tags=["Dados crus"])
+# importe os routers das rotas soltas na raiz
+from dados_crus import router as dados_crus_router
+from processamento_crus import router as processamento_crus_router
 
-# URL da nova rota de processamento
-PROCESS_URL = "https://uwb-api.onrender.com/processamento-crus/ingest"
-
-# TAGs reservadas para calibração: devem ser ignoradas
-CALIBRATION_TAGS = {"62", "63"}
-
-# Regex que captura tid, range(...), kx e ky
-RE_LINE = re.compile(
-    r"tid\s*:\s*(?P<tid>\d+).*?"
-    r"range\s*:\s*\((?P<rng>[^)]*)\).*?"
-    r"kx\s*:\s*(?P<kx>[-+]?\d*\.?\d+).*?"
-    r"ky\s*:\s*(?P<ky>[-+]?\d*\.?\d+)",
-    re.IGNORECASE,
+app = FastAPI(
+    title="UWB API v2",
+    description="API para gerenciamento e processamento de dados UWB",
+    version="0.0.1",
 )
 
-def _to_float_or_none(x: str):
-    x = x.strip()
-    if x == "" or x.lower() == "nan":
-        return None
-    try:
-        return float(x)
-    except ValueError:
-        return None
+# CORS aberto para dev (restrinja depois)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def parse_line(line: str):
-    """Extrai tid, range[8], kx e ky de uma linha AT+RANGE."""
-    m = RE_LINE.search(line)
-    if not m:
-        return None
-    tid = m.group("tid").strip()
-    parts = [p.strip() for p in m.group("rng").split(",")]
-    vals = (parts + [""] * 8)[:8]
-    floats = [_to_float_or_none(v) for v in vals]
-    kx = _to_float_or_none(m.group("kx"))
-    ky = _to_float_or_none(m.group("ky"))
-    return tid, floats, kx, ky
+# cria tabelas e testa conexão no start
+@app.on_event("startup")
+def on_startup():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    Base.metadata.create_all(bind=engine)
 
+# ---- rotas principais ----
+app.include_router(dados_crus_router)
+app.include_router(processamento_crus_router)
 
-@router.post("/ingest")
-def ingest_dados_crus(
-    payload: Union[str, List[str]] = Body(
-        ...,
-        embed=True,
-        example=[
-            "AT+RANGE=tid:4,mask:01,seq:218,range:(3,0,0,0,0,0,0,0),kx:100.0,ky:200.0,user:user1"
-        ],
-    )
-):
-    """
-    Recebe string ou lista de strings (linhas AT+RANGE),
-    grava em `distancias_uwb` e, depois, chama /processamento-crus/ingest.
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "version": "0.0.1"}
 
-    Observação: leituras das TAGs 62 e 63 (calibração) são ignoradas:
-    não são persistidas e não são encaminhadas.
-    """
-    # Normaliza payload → lista de linhas válidas
-    if isinstance(payload, str):
-        lines = [ln for ln in payload.splitlines() if ln.strip()]
-    else:
-        lines = [ln for ln in payload if isinstance(ln, str) and ln.strip()]
-
-    if not lines:
-        raise HTTPException(status_code=400, detail="payload vazio")
-
-    db = SessionLocal()
-    try:
-        rows = []
-        now = datetime.utcnow()
-        skipped_calibration = 0
-        skipped_invalid = 0
-
-        for line in lines:
-            parsed = parse_line(line)
-            if not parsed:
-                skipped_invalid += 1
-                continue
-
-            tag, vals, kx, ky = parsed
-
-            # IGNORA calibração (tags 62 e 63)
-            if tag in CALIBRATION_TAGS:
-                skipped_calibration += 1
-                continue
-
-            rows.append(
-                models.DistanciaUWB(
-                    tag_number=tag,
-                    da0=vals[0], da1=vals[1], da2=vals[2], da3=vals[3],
-                    da4=vals[4], da5=vals[5], da6=vals[6], da7=vals[7],
-                    kx=kx, ky=ky, criado_em=now,
-                )
-            )
-
-        if not rows:
-            # nada elegível para gravação após filtros
-            raise HTTPException(
-                status_code=422,
-                detail="nenhuma linha elegível (todas inválidas ou de calibração 62/63)",
-            )
-
-        db.add_all(rows)
-        db.commit()
-
-        # Prepara payload simplificado para o processamento (apenas o que foi salvo)
-        serialized = [
-            {
-                "id": r.id,
-                "tag_number": r.tag_number,
-                "da": [r.da0, r.da1, r.da2, r.da3, r.da4, r.da5, r.da6, r.da7],
-                "kx": r.kx,
-                "ky": r.ky,
-                "criado_em": r.criado_em.isoformat() if r.criado_em else None,
-            }
-            for r in rows
-        ]
-
-        # Envia os dados recém-gravados para a rota de processamento
-        sent_to_processamento = False
-        try:
-            res = requests.post(PROCESS_URL, json={"dados": serialized}, timeout=3)
-            sent_to_processamento = res.status_code in (200, 201)
-            if not sent_to_processamento:
-                print(f"[AVISO] Falha ao acionar processamento_crus: {res.status_code} {res.text}")
-        except Exception as e:
-            print(f"[ERRO] Não foi possível contatar {PROCESS_URL}: {e}")
-
-        return {
-            "saved": len(rows),
-            "skipped_calibration": skipped_calibration,
-            "skipped_invalid": skipped_invalid,
-            "sent_to_processamento": sent_to_processamento,
-        }
-
-    except HTTPException:
-        db.rollback()
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Erro ao salvar: {e}")
-    finally:
-        db.close()
+@app.get("/")
+def root():
+    return {"message": "Bem-vindo à UWB API v2 🎯"}
