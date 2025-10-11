@@ -15,9 +15,9 @@ RE_LINE = re.compile(
     re.IGNORECASE,
 )
 
-# capturam kx: <num> e ky: <num> (opcionais, em qualquer ordem)
-RE_KX = re.compile(r"\bkx\s*:\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
-RE_KY = re.compile(r"\bky\s*:\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+# kx/ky numéricos (robusto: +/-, .123, 123., 123.45, 0.00 etc.)
+NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
+RE_K_BOTH = re.compile(rf"\b(k[xy])\s*:\s*({NUM})", re.IGNORECASE)
 
 
 def _to_float_or_none(x: str):
@@ -30,11 +30,6 @@ def _to_float_or_none(x: str):
         return None
 
 
-def _find_optional_number(rx: re.Pattern, s: str) -> Optional[float]:
-    m = rx.search(s)
-    return float(m.group(1)) if m else None
-
-
 def parse_line(line: str) -> Optional[Tuple[str, list, Optional[float], Optional[float]]]:
     """
     Retorna:
@@ -45,13 +40,24 @@ def parse_line(line: str) -> Optional[Tuple[str, list, Optional[float], Optional
     if not m:
         return None
 
+    # tid
     tid = m.group("tid").strip()
+
+    # range -> da0..da7
     parts = [p.strip() for p in m.group("rng").split(",")]
-    vals = (parts + [""] * 8)[:8]  # garante 8 posições
+    vals = (parts + [""] * 8)[:8]
     floats = [_to_float_or_none(v) for v in vals]
 
-    kx = _find_optional_number(RE_KX, line)
-    ky = _find_optional_number(RE_KY, line)
+    # kx/ky em qualquer lugar da linha (ordem livre)
+    kx: Optional[float] = None
+    ky: Optional[float] = None
+    for mm in RE_K_BOTH.finditer(line):
+        label = mm.group(1).lower()  # 'kx' ou 'ky'
+        value = float(mm.group(2))
+        if label == "kx":
+            kx = value
+        elif label == "ky":
+            ky = value
 
     return str(tid), floats, kx, ky
 
@@ -63,8 +69,7 @@ def ingest_dados_crus(
         ...,
         embed=True,
         example=[
-            # kx/ky são opcionais; se vierem, serão gravados
-            "AT+RANGE=tid:4,mask:01,seq:218,range:(3,0,0,0,0,0,0,0),kx:12.34,ky:-5.67,rssi:(-79.31,0,0,0,0,0,0,0)"
+            "AT+RANGE=tid:63,range:(366,329,0,0,0,0,0,0),kx:0.00,ky:358.95,user:user1"
         ],
     )
 ):
@@ -74,7 +79,7 @@ def ingest_dados_crus(
 
     Campos:
       - obrigatórios: tid, range:(da0..da7)
-      - opcionais: kx:<float>, ky:<float>
+      - opcionais: kx:<float>, ky:<float> (em qualquer posição)
     Obs.: `id` é autoincrement e não deve ser informado.
     """
     # Normaliza para lista de linhas
@@ -103,8 +108,7 @@ def ingest_dados_crus(
                     tag_number=tag,
                     da0=vals[0], da1=vals[1], da2=vals[2], da3=vals[3],
                     da4=vals[4], da5=vals[5], da6=vals[6], da7=vals[7],
-                    kx=kx,  # novos campos
-                    ky=ky,  # novos campos
+                    kx=kx, ky=ky,
                     criado_em=now,
                 )
             )
