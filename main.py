@@ -1,12 +1,14 @@
+# main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-# 👇 importa direto da raiz
 from db import Base, engine
-import models  # garante que as classes sejam registradas no Base antes do create_all
-from dados_crus import router as dados_crus_router
+import models  # registra os models antes do create_all
 
+# importe os routers das rotas soltas na raiz
+from dados_crus import router as dados_crus_router
+from processamento_crus import router as processamento_crus_router
 
 app = FastAPI(
     title="UWB API v2",
@@ -14,7 +16,7 @@ app = FastAPI(
     version="0.0.1",
 )
 
-# 🌐 CORS (liberado no dev; restrinja em produção)
+# CORS aberto para dev (restrinja depois)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,25 +25,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-app.include_router(dados_crus_router)
-
-
-# 🔌 Testa conexão e cria tabelas no startup (enquanto não usa Alembic)
+# cria tabelas e testa conexão no start
 @app.on_event("startup")
 def on_startup():
-    # Teste rápido de conexão (útil no Render)
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
-    # Cria tabelas dos models já importados (não sobrescreve existentes)
     Base.metadata.create_all(bind=engine)
 
-# 🩺 Healthcheck
+# ---- rotas principais ----
+app.include_router(dados_crus_router)
+app.include_router(processamento_crus_router)
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "version": "0.0.1"}
 
-# 👋 Rota raiz
 @app.get("/")
 def root():
     return {"message": "Bem-vindo à UWB API v2 🎯"}
