@@ -3,3 +3,4 @@ uvicorn[standard]==0.30.6
 SQLAlchemy==2.0.34
 psycopg[binary]==3.2.10   # 👈 aqui
 pydantic==2.12.0
+requests
