@@ -10,6 +10,12 @@ import models
 
 router = APIRouter(prefix="/dados-crus", tags=["Dados crus"])
 
+# ======================= AJUSTE GLOBAL =======================
+# Offset em centímetros a ser SUBTRAÍDO de todas as medidas recebidas
+# (da0..da7, kx, ky). Ajuste conforme sua calibração medida em campo.
+DIST_OFFSET_CM: float = 40.0
+# =============================================================
+
 # URL da nova rota de processamento
 PROCESS_URL = "https://uwb-api.onrender.com/processamento-crus/ingest"
 
@@ -34,6 +40,12 @@ def _to_float_or_none(x: str):
     except ValueError:
         return None
 
+def _apply_offset(v: float | None) -> float | None:
+    """Subtrai o offset global quando houver valor."""
+    if v is None:
+        return None
+    return v - DIST_OFFSET_CM
+
 def parse_line(line: str):
     """Extrai tid, range[8], kx e ky de uma linha AT+RANGE."""
     m = RE_LINE.search(line)
@@ -54,7 +66,7 @@ def ingest_dados_crus(
         ...,
         embed=True,
         example=[
-            "AT+RANGE=tid:4,mask:01,seq:218,range:(3,0,0,0,0,0,0,0),kx:100.0,ky:200.0,user:user1"
+            "AT+RANGE=tid:4,mask:01,seq:218,range:(100,110,103,0,0,0,0,0),kx:152.75,ky:101.3,user:user1"
         ],
     )
 ):
@@ -94,12 +106,17 @@ def ingest_dados_crus(
                 skipped_calibration += 1
                 continue
 
+            # Aplica offset global (subtração) em todas as medidas
+            adj_vals = [_apply_offset(v) for v in vals]
+            adj_kx = _apply_offset(kx)
+            adj_ky = _apply_offset(ky)
+
             rows.append(
                 models.DistanciaUWB(
                     tag_number=tag,
-                    da0=vals[0], da1=vals[1], da2=vals[2], da3=vals[3],
-                    da4=vals[4], da5=vals[5], da6=vals[6], da7=vals[7],
-                    kx=kx, ky=ky, criado_em=now,
+                    da0=adj_vals[0], da1=adj_vals[1], da2=adj_vals[2], da3=adj_vals[3],
+                    da4=adj_vals[4], da5=adj_vals[5], da6=adj_vals[6], da7=adj_vals[7],
+                    kx=adj_kx, ky=adj_ky, criado_em=now,
                 )
             )
 
@@ -141,6 +158,7 @@ def ingest_dados_crus(
             "skipped_calibration": skipped_calibration,
             "skipped_invalid": skipped_invalid,
             "sent_to_processamento": sent_to_processamento,
+            "dist_offset_cm": DIST_OFFSET_CM,
         }
 
     except HTTPException:
