@@ -19,15 +19,17 @@ DIST_OFFSET_CM: float = 40.0
 # URL da nova rota de processamento
 PROCESS_URL = "https://uwb-api.onrender.com/processamento-crus/ingest"
 
-# TAGs reservadas para calibração: devem ser ignoradas
+# TAGs reservadas para calibração: devem ser ignoradas (não gravar / não encaminhar)
 CALIBRATION_TAGS = {"62", "63"}
 
-# Regex que captura tid, range(...), kx e ky
+# Regex que captura tid, range(...), kx, ky, cmd e user
 RE_LINE = re.compile(
     r"tid\s*:\s*(?P<tid>\d+).*?"
     r"range\s*:\s*\((?P<rng>[^)]*)\).*?"
     r"kx\s*:\s*(?P<kx>[-+]?\d*\.?\d+).*?"
-    r"ky\s*:\s*(?P<ky>[-+]?\d*\.?\d+)",
+    r"ky\s*:\s*(?P<ky>[-+]?\d*\.?\d+)"
+    r"(?:.*?cmd\s*:\s*(?P<cmd>\d+))?"
+    r"(?:.*?user\s*:\s*(?P<user>[\w.@+\-]+))?",
     re.IGNORECASE,
 )
 
@@ -41,13 +43,19 @@ def _to_float_or_none(x: str):
         return None
 
 def _apply_offset(v: float | None) -> float | None:
-    """Subtrai o offset global quando houver valor."""
     if v is None:
         return None
     return v - DIST_OFFSET_CM
 
+def _fmt(v: float | None) -> str | None:
+    """Converte para string (colunas kx/ky são varchar)."""
+    if v is None:
+        return None
+    # use str(v) para preservar exatamente o valor; se preferir 2 casas: f"{v:.2f}"
+    return str(v)
+
 def parse_line(line: str):
-    """Extrai tid, range[8], kx e ky de uma linha AT+RANGE."""
+    """Extrai tid, range[8], kx, ky, cmd, user de uma linha AT+RANGE."""
     m = RE_LINE.search(line)
     if not m:
         return None
@@ -57,8 +65,56 @@ def parse_line(line: str):
     floats = [_to_float_or_none(v) for v in vals]
     kx = _to_float_or_none(m.group("kx"))
     ky = _to_float_or_none(m.group("ky"))
-    return tid, floats, kx, ky
+    cmd = int(m.group("cmd")) if m.group("cmd") else 0
+    user = (m.group("user") or "").strip() or None
+    return tid, floats, kx, ky, cmd, user
 
+# ---------- helpers de relatório (usando os nomes das colunas do print) ----------
+def _open_or_update_relatorio(db, user: str, kx_f: float | None, ky_f: float | None):
+    """
+    Abre/atualiza um relatório 'ativo' (fim_do_relatorio IS NULL) para o usuário.
+    - Se não existir, cria com inicio_do_relator = agora.
+    - Atualiza kx/ky (varchar) quando fornecidos.
+    """
+    now = datetime.utcnow()
+    rel = (
+        db.query(models.Relatorio)
+        .filter(models.Relatorio.user == user, models.Relatorio.fim_do_relatorio.is_(None))
+        .order_by(models.Relatorio.relatorio_numbe.desc())
+        .first()
+    )
+    kx_s = _fmt(kx_f)
+    ky_s = _fmt(ky_f)
+
+    if rel is None:
+        rel = models.Relatorio(
+            user=user,
+            inicio_do_relator=now,
+            kx=kx_s,
+            ky=ky_s,
+            # nome opcional; se quiser, pode preencher com user:
+            # nome=user,
+        )
+        db.add(rel)
+    else:
+        if getattr(rel, "inicio_do_relator", None) is None:
+            rel.inicio_do_relator = now
+        if kx_s is not None:
+            rel.kx = kx_s
+        if ky_s is not None:
+            rel.ky = ky_s
+    # commit ocorre fora
+
+def _close_relatorio(db, user: str):
+    """Fecha o relatório ativo do usuário preenchendo fim_do_relatorio."""
+    rel = (
+        db.query(models.Relatorio)
+        .filter(models.Relatorio.user == user, models.Relatorio.fim_do_relatorio.is_(None))
+        .order_by(models.Relatorio.relatorio_numbe.desc())
+        .first()
+    )
+    if rel:
+        rel.fim_do_relatorio = datetime.utcnow()
 
 @router.post("/ingest")
 def ingest_dados_crus(
@@ -66,18 +122,17 @@ def ingest_dados_crus(
         ...,
         embed=True,
         example=[
-            "AT+RANGE=tid:4,mask:01,seq:218,range:(100,110,103,0,0,0,0,0),kx:152.75,ky:101.3,user:user1"
+            "AT+RANGE=tid:4,mask:01,seq:218,range:(100,110,103,0,0,0,0,0),kx:152.75,ky:101.3,cmd:2,user:user1"
         ],
     )
 ):
     """
-    Recebe string ou lista de strings (linhas AT+RANGE),
-    grava em `distancias_uwb` e, depois, chama /processamento-crus/ingest.
-
-    Observação: leituras das TAGs 62 e 63 (calibração) são ignoradas:
-    não são persistidas e não são encaminhadas.
+    Fluxo:
+      - cmd=0: descarta linha (não grava nem encaminha)
+      - cmd=1: abre/atualiza relatório (inicio_do_relator, kx, ky) para 'user'
+      - cmd=3: fecha relatório (fim_do_relatorio) para 'user'
+      - Linhas de TAG 62/63 são ignoradas para persistência/encaminhamento.
     """
-    # Normaliza payload → lista de linhas válidas
     if isinstance(payload, str):
         lines = [ln for ln in payload.splitlines() if ln.strip()]
     else:
@@ -88,10 +143,13 @@ def ingest_dados_crus(
 
     db = SessionLocal()
     try:
-        rows = []
+        rows_to_save = []
         now = datetime.utcnow()
         skipped_calibration = 0
         skipped_invalid = 0
+        skipped_cmd0 = 0
+        relatorios_abertos = 0
+        relatorios_fechados = 0
 
         for line in lines:
             parsed = parse_line(line)
@@ -99,19 +157,32 @@ def ingest_dados_crus(
                 skipped_invalid += 1
                 continue
 
-            tag, vals, kx, ky = parsed
+            tag, vals, kx, ky, cmd, user = parsed
 
-            # IGNORA calibração (tags 62 e 63)
+            # Trata comandos de relatório
+            if cmd == 1 and user:
+                _open_or_update_relatorio(db, user, _apply_offset(kx), _apply_offset(ky))
+                relatorios_abertos += 1
+            elif cmd == 3 and user:
+                _close_relatorio(db, user)
+                relatorios_fechados += 1
+
+            # Descartar completamente cmd=0
+            if cmd == 0:
+                skipped_cmd0 += 1
+                continue
+
+            # Ignora calibração (tags 62/63)
             if tag in CALIBRATION_TAGS:
                 skipped_calibration += 1
                 continue
 
-            # Aplica offset global (subtração) em todas as medidas
+            # Persistência normal em distancias_uwb
             adj_vals = [_apply_offset(v) for v in vals]
             adj_kx = _apply_offset(kx)
             adj_ky = _apply_offset(ky)
 
-            rows.append(
+            rows_to_save.append(
                 models.DistanciaUWB(
                     tag_number=tag,
                     da0=adj_vals[0], da1=adj_vals[1], da2=adj_vals[2], da3=adj_vals[3],
@@ -120,17 +191,12 @@ def ingest_dados_crus(
                 )
             )
 
-        if not rows:
-            # nada elegível para gravação após filtros
-            raise HTTPException(
-                status_code=422,
-                detail="nenhuma linha elegível (todas inválidas ou de calibração 62/63)",
-            )
-
-        db.add_all(rows)
+        # Commit das mudanças (relatório + leituras)
+        if rows_to_save:
+            db.add_all(rows_to_save)
         db.commit()
 
-        # Prepara payload simplificado para o processamento (apenas o que foi salvo)
+        # Serializa apenas o que foi salvo
         serialized = [
             {
                 "id": r.id,
@@ -140,23 +206,26 @@ def ingest_dados_crus(
                 "ky": r.ky,
                 "criado_em": r.criado_em.isoformat() if r.criado_em else None,
             }
-            for r in rows
+            for r in rows_to_save
         ]
 
-        # Envia os dados recém-gravados para a rota de processamento
         sent_to_processamento = False
-        try:
-            res = requests.post(PROCESS_URL, json={"dados": serialized}, timeout=3)
-            sent_to_processamento = res.status_code in (200, 201)
-            if not sent_to_processamento:
-                print(f"[AVISO] Falha ao acionar processamento_crus: {res.status_code} {res.text}")
-        except Exception as e:
-            print(f"[ERRO] Não foi possível contatar {PROCESS_URL}: {e}")
+        if serialized:
+            try:
+                res = requests.post(PROCESS_URL, json={"dados": serialized}, timeout=3)
+                sent_to_processamento = res.status_code in (200, 201)
+                if not sent_to_processamento:
+                    print(f"[AVISO] Falha ao acionar processamento_crus: {res.status_code} {res.text}")
+            except Exception as e:
+                print(f"[ERRO] Não foi possível contatar {PROCESS_URL}: {e}")
 
         return {
-            "saved": len(rows),
+            "saved": len(serialized),
+            "skipped_cmd0": skipped_cmd0,
             "skipped_calibration": skipped_calibration,
             "skipped_invalid": skipped_invalid,
+            "relatorios_abertos_ou_atualizados": relatorios_abertos,
+            "relatorios_fechados": relatorios_fechados,
             "sent_to_processamento": sent_to_processamento,
             "dist_offset_cm": DIST_OFFSET_CM,
         }
