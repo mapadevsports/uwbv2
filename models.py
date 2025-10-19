@@ -60,14 +60,14 @@ class DistanciaProcessada(Base):
 class Relatorio(Base):
     """
     Mapeamento da tabela 'relatorio' conforme o screenshot.
-    Observação: a coluna primária aparece como 'relatorio_numbe' (sem 'r' no fim).
+    Observação: a coluna primária aparece como 'relatorio_number' (sem 'r' no fim).
     Mantemos exatamente esse nome para evitar divergência com o schema atual.
     """
     __tablename__ = "relatorio"
 
     # Nome físico da coluna preservado via primeiro argumento do mapped_column
-    relatorio_numbe: Mapped[int] = mapped_column(
-        "relatorio_numbe", Integer, primary_key=True, autoincrement=True, nullable=False
+    relatorio_number: Mapped[int] = mapped_column(
+        "relatorio_number", Integer, primary_key=True, autoincrement=True, nullable=False
     )
 
     inicio_do_relatorio: Mapped[DateTime | None] = mapped_column(
@@ -94,4 +94,4 @@ class Relatorio(Base):
     user: Mapped[str | None] = mapped_column(String, nullable=True)
 
     def __repr__(self) -> str:
-        return f"<Relatorio #{self.relatorio_numbe} user={self.user} nome={self.nome}>"
+        return f"<Relatorio #{self.relatorio_number} user={self.user} nome={self.nome}>"
