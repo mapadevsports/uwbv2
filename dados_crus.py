@@ -12,14 +12,13 @@ router = APIRouter(prefix="/dados-crus", tags=["Dados crus"])
 
 # ======================= AJUSTE GLOBAL =======================
 # Offset em centímetros a ser SUBTRAÍDO de todas as medidas recebidas
-# (da0..da7, kx, ky). Ajuste conforme sua calibração medida em campo.
 DIST_OFFSET_CM: float = 40.0
 # =============================================================
 
 # URL da nova rota de processamento
 PROCESS_URL = "https://uwb-api.onrender.com/processamento-crus/ingest"
 
-# TAGs reservadas para calibração: devem ser ignoradas (não gravar / não encaminhar)
+# TAGs reservadas para calibração (ignorar)
 CALIBRATION_TAGS = {"62", "63"}
 
 # Regex que captura tid, range(...), kx, ky, cmd e user
@@ -33,6 +32,7 @@ RE_LINE = re.compile(
     re.IGNORECASE,
 )
 
+
 def _to_float_or_none(x: str):
     x = x.strip()
     if x == "" or x.lower() == "nan":
@@ -42,17 +42,20 @@ def _to_float_or_none(x: str):
     except ValueError:
         return None
 
+
 def _apply_offset(v: float | None) -> float | None:
+    """Aplica offset global nas medidas."""
     if v is None:
         return None
     return v - DIST_OFFSET_CM
+
 
 def _fmt(v: float | None) -> str | None:
     """Converte para string (colunas kx/ky são varchar)."""
     if v is None:
         return None
-    # use str(v) para preservar exatamente o valor; se preferir 2 casas: f"{v:.2f}"
     return str(v)
+
 
 def parse_line(line: str):
     """Extrai tid, range[8], kx, ky, cmd, user de uma linha AT+RANGE."""
@@ -69,52 +72,55 @@ def parse_line(line: str):
     user = (m.group("user") or "").strip() or None
     return tid, floats, kx, ky, cmd, user
 
-# ---------- helpers de relatório (usando os nomes das colunas do print) ----------
+
+# ---------- helpers de relatório ----------
 def _open_or_update_relatorio(db, user: str, kx_f: float | None, ky_f: float | None):
     """
-    Abre/atualiza um relatório 'ativo' (fim_do_relatorio IS NULL) para o usuário.
-    - Se não existir, cria com inicio_do_relator = agora.
+    Abre/atualiza um relatório ativo (fim_do_relatorio IS NULL) para o usuário.
+    - Se não existir, cria com inicio_do_relatorio = agora.
     - Atualiza kx/ky (varchar) quando fornecidos.
     """
     now = datetime.utcnow()
     rel = (
         db.query(models.Relatorio)
         .filter(models.Relatorio.user == user, models.Relatorio.fim_do_relatorio.is_(None))
-        .order_by(models.Relatorio.relatorio_numbe.desc())
+        .order_by(models.Relatorio.relatorio_number.desc())
         .first()
     )
+
     kx_s = _fmt(kx_f)
     ky_s = _fmt(ky_f)
 
     if rel is None:
         rel = models.Relatorio(
             user=user,
-            inicio_do_relator=now,
+            inicio_do_relatorio=now,
             kx=kx_s,
             ky=ky_s,
-            # nome opcional; se quiser, pode preencher com user:
-            # nome=user,
+            # nome=user opcional
         )
         db.add(rel)
     else:
-        if getattr(rel, "inicio_do_relator", None) is None:
-            rel.inicio_do_relator = now
+        if getattr(rel, "inicio_do_relatorio", None) is None:
+            rel.inicio_do_relatorio = now
         if kx_s is not None:
             rel.kx = kx_s
         if ky_s is not None:
             rel.ky = ky_s
-    # commit ocorre fora
+    # commit será feito depois
+
 
 def _close_relatorio(db, user: str):
-    """Fecha o relatório ativo do usuário preenchendo fim_do_relatorio."""
+    """Fecha o relatório ativo do usuário (fim_do_relatorio = agora)."""
     rel = (
         db.query(models.Relatorio)
         .filter(models.Relatorio.user == user, models.Relatorio.fim_do_relatorio.is_(None))
-        .order_by(models.Relatorio.relatorio_numbe.desc())
+        .order_by(models.Relatorio.relatorio_number.desc())
         .first()
     )
     if rel:
         rel.fim_do_relatorio = datetime.utcnow()
+
 
 @router.post("/ingest")
 def ingest_dados_crus(
@@ -129,9 +135,10 @@ def ingest_dados_crus(
     """
     Fluxo:
       - cmd=0: descarta linha (não grava nem encaminha)
-      - cmd=1: abre/atualiza relatório (inicio_do_relator, kx, ky) para 'user'
-      - cmd=3: fecha relatório (fim_do_relatorio) para 'user'
-      - Linhas de TAG 62/63 são ignoradas para persistência/encaminhamento.
+      - cmd=1: abre/atualiza relatório (inicio_do_relatorio, kx, ky)
+      - cmd=3: fecha relatório (fim_do_relatorio)
+      - Tags 62/63: ignoradas
+      - Demais casos: grava normalmente
     """
     if isinstance(payload, str):
         lines = [ln for ln in payload.splitlines() if ln.strip()]
@@ -159,7 +166,7 @@ def ingest_dados_crus(
 
             tag, vals, kx, ky, cmd, user = parsed
 
-            # Trata comandos de relatório
+            # Comandos
             if cmd == 1 and user:
                 _open_or_update_relatorio(db, user, _apply_offset(kx), _apply_offset(ky))
                 relatorios_abertos += 1
@@ -167,17 +174,17 @@ def ingest_dados_crus(
                 _close_relatorio(db, user)
                 relatorios_fechados += 1
 
-            # Descartar completamente cmd=0
+            # Descartar cmd=0
             if cmd == 0:
                 skipped_cmd0 += 1
                 continue
 
-            # Ignora calibração (tags 62/63)
+            # Ignorar calibração
             if tag in CALIBRATION_TAGS:
                 skipped_calibration += 1
                 continue
 
-            # Persistência normal em distancias_uwb
+            # Grava distâncias
             adj_vals = [_apply_offset(v) for v in vals]
             adj_kx = _apply_offset(kx)
             adj_ky = _apply_offset(ky)
@@ -191,12 +198,11 @@ def ingest_dados_crus(
                 )
             )
 
-        # Commit das mudanças (relatório + leituras)
+        # Commit único
         if rows_to_save:
             db.add_all(rows_to_save)
         db.commit()
 
-        # Serializa apenas o que foi salvo
         serialized = [
             {
                 "id": r.id,
@@ -217,7 +223,7 @@ def ingest_dados_crus(
                 if not sent_to_processamento:
                     print(f"[AVISO] Falha ao acionar processamento_crus: {res.status_code} {res.text}")
             except Exception as e:
-                print(f"[ERRO] Não foi possível contatar {PROCESS_URL}: {e}")
+                print(f"[ERRO] Falha ao contatar {PROCESS_URL}: {e}")
 
         return {
             "saved": len(serialized),
