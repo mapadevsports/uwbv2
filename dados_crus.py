@@ -1,4 +1,4 @@
-# dados_crus.py (produção, limpo)
+# dados_crus.py (produção, versão com offset também em kx/ky e nova ancora A3)
 from fastapi import APIRouter, Body, HTTPException
 from typing import List, Union, Optional
 from datetime import datetime
@@ -12,12 +12,15 @@ import models
 router = APIRouter(prefix="/dados-crus", tags=["Dados crus"])
 
 # ======================= AJUSTE GLOBAL =======================
+# Offset em cm aplicado a todas as distâncias (da0..da7) e também em kx/ky
 DIST_OFFSET_CM: float = 40.0
 # =============================================================
 
 PROCESS_URL = "https://uwb-api.onrender.com/processamento-crus/ingest"
 CALIBRATION_TAGS = {"62", "63"}
 
+# Exemplo de linha:
+# AT+RANGE=tid:4,mask:01,seq:218,range:(100,110,103,120,0,0,0,0),kx:152.75,ky:101.3,cmd:2,user:user1
 RE_LINE = re.compile(
     r"tid\s*:\s*(?P<tid>\d+).*?"
     r"range\s*:\s*\((?P<rng>[^)]*)\).*?"
@@ -28,6 +31,7 @@ RE_LINE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------- FUNÇÕES AUXILIARES ----------
 def _to_float_or_none(x: str):
     x = x.strip()
     if x == "" or x.lower() == "nan":
@@ -38,6 +42,7 @@ def _to_float_or_none(x: str):
         return None
 
 def _apply_offset(v: float | None) -> float | None:
+    """Aplica o offset em todas as distâncias, incluindo kx e ky."""
     if v is None:
         return None
     return v - DIST_OFFSET_CM
@@ -48,6 +53,7 @@ def _fmt_str(v: float | None) -> Optional[str]:
     return str(v)
 
 def parse_line(line: str):
+    """Extrai tid, ranges, kx, ky, cmd e user da linha AT+RANGE."""
     m = RE_LINE.search(line)
     if not m:
         return None
@@ -61,8 +67,9 @@ def parse_line(line: str):
     user = (m.group("user") or "").strip() or None
     return tid, floats, kx, ky, cmd, user
 
-# ---------- RELATÓRIO (SQL direto, nomes exatos) ----------
+# ---------- RELATÓRIO ----------
 def _relatorio_open_or_update(db, user: str, kx_f: float | None, ky_f: float | None):
+    """Abre ou atualiza o relatório do usuário."""
     if not user:
         return
     now = datetime.utcnow()
@@ -99,6 +106,7 @@ def _relatorio_open_or_update(db, user: str, kx_f: float | None, ky_f: float | N
         )
 
 def _relatorio_close(db, user: str):
+    """Fecha o relatório do usuário atual."""
     if not user:
         return
     now = datetime.utcnow()
@@ -119,22 +127,23 @@ def _relatorio_close(db, user: str):
             {"fim": now, "id": row["relatorio_number"]},
         )
 
+# ---------- ENDPOINT PRINCIPAL ----------
 @router.post("/ingest")
 def ingest_dados_crus(
     payload: Union[str, List[str]] = Body(
         ...,
         embed=True,
         example=[
-            "AT+RANGE=tid:4,mask:01,seq:218,range:(100,110,103,0,0,0,0,0),kx:152.75,ky:101.3,cmd:2,user:user1"
+            "AT+RANGE=tid:4,mask:0F,seq:218,range:(100,110,103,120,0,0,0,0),kx:152.75,ky:101.3,cmd:2,user:user1"
         ],
     )
 ):
     """
-    - cmd=0: descarta (não grava/encaminha)
-    - cmd=1: abre/atualiza relatório (inicio_do_relatorio, kx, ky)
-    - cmd=3: fecha relatório (fim_do_relatorio)
+    - cmd=0: descarta
+    - cmd=1: abre/atualiza relatório
+    - cmd=3: fecha relatório
     - TAG 62/63: ignora
-    - Outros: grava em distancias_uwb e encaminha para processamento
+    - Outros: grava e encaminha para processamento
     """
     # Normalização
     if isinstance(payload, str):
@@ -178,27 +187,33 @@ def ingest_dados_crus(
                 skipped_calibration += 1
                 continue
 
-            # Grava distâncias
+            # --- Aplica offset nas distâncias e em kx/ky ---
             adj_vals = [_apply_offset(v) for v in vals]
             adj_kx = _apply_offset(kx)
             adj_ky = _apply_offset(ky)
 
+            # --- Nova ancora A3 ---
+            # da3 corresponde à âncora A3, que fecha o retângulo no ponto (kx, ky)
+            # Portanto, apenas garantimos que o campo existe, mesmo que o valor venha como 0
+            if len(adj_vals) < 4:
+                adj_vals = (adj_vals + [0.0] * 4)[:8]
+
+            # --- Grava no banco ---
             rows_to_save.append(
                 models.DistanciaUWB(
                     tag_number=tag,
                     da0=adj_vals[0], da1=adj_vals[1], da2=adj_vals[2], da3=adj_vals[3],
                     da4=adj_vals[4], da5=adj_vals[5], da6=adj_vals[6], da7=adj_vals[7],
                     kx=adj_kx, ky=adj_ky,
-                    # criado_em: server_default=now() cuida
                 )
             )
 
-        # Commit (relatório + leituras)
+        # --- Commit das leituras e relatórios ---
         if rows_to_save:
             db.add_all(rows_to_save)
         db.commit()
 
-        # Encaminha apenas o que foi salvo
+        # --- Monta JSON igual ao formato atual ---
         serialized = [
             {
                 "id": r.id,
@@ -211,13 +226,13 @@ def ingest_dados_crus(
             for r in rows_to_save
         ]
 
+        # --- Envia para o processamento (sem mudanças no formato) ---
         sent_to_processamento = False
         if serialized:
             try:
                 res = requests.post(PROCESS_URL, json={"dados": serialized}, timeout=3)
                 sent_to_processamento = res.status_code in (200, 201)
             except Exception:
-                # silencioso em produção — só não marca como enviado
                 sent_to_processamento = False
 
         return {
