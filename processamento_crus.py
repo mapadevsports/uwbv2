@@ -76,8 +76,8 @@ def _solve_xy_lsq(anchors: List[Tuple[float, float, float]]) -> Optional[Tuple[f
         xi, yi, di = anchors[i]
         ai1 = 2.0 * (xi - xj)
         ai2 = 2.0 * (yi - yj)
-        bi = (di * di - dj * dj) - (xi * xi + yi * yi) + (xj * xj + yj * yj)
-
+        bi = (xi*xi + yi*yi - di*di) - (xj*xj + yj*yj - dj*dj)
+     
         # acumula A^T A e A^T b
         a11 += ai1 * ai1
         a12 += ai1 * ai2
